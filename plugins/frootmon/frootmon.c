@@ -39,6 +39,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <netinet/in.h>
+#include <search.h>
 
 #include "dnscap_common.h"
 
@@ -47,6 +48,61 @@ static int         opt_f = 0;
 static const char* opt_x = 0;
 
 output_t frootmon_output;
+
+typedef struct {
+	uint64_t	key;
+	uint64_t	count;
+} frootmon_tnode;
+
+static posix_tnode *req_root = NULL;
+static posix_tnode *res_root = NULL;
+
+static int frootmon_cmp(const void *a, const void *b)
+{
+	const frootmon_tnode *ta = a;
+	const frootmon_tnode *tb = b;
+
+	if (ta->key < tb->key) {
+		return -1;
+	} else if (ta->key > tb->key) {
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+static void frootmon_inc(posix_tnode** root, uint64_t key)
+{
+	frootmon_tnode to_find = { key, 0 };
+	posix_tnode* node = tfind(&to_find, root, frootmon_cmp);
+	if (node) {
+		frootmon_tnode *data = *(frootmon_tnode **)node;
+		++(data->count);
+	} else {
+		frootmon_tnode *data = malloc(sizeof(frootmon_tnode));
+		data->key = key;
+		data->count = 1;
+		tsearch(data, root, frootmon_cmp);
+	}
+}
+
+static void frootmon_clear(posix_tnode **root)
+{
+	frootmon_tnode *data;
+	while (*root != NULL) {
+		data = *(frootmon_tnode **)(*root);
+		tdelete(data, root, frootmon_cmp);
+		free(data);
+	}
+}
+
+static void frootmon_dump(const posix_tnode* node, VISIT v, int level)
+{
+	if (v == leaf || v == postorder) {
+		frootmon_tnode *data = *(frootmon_tnode **)node;
+		fprintf(stderr, "%08lx: %ld, %d\n", data->key, data->count, level);
+	}
+}
 
 void frootmon_usage()
 {
@@ -99,7 +155,7 @@ int frootmon_start(logerr_t* a_logerr)
 void frootmon_stop()
 {
     /*
-     * The "start" function is called once, when the program
+     * The "stop" function is called once, when the program
      * is exiting normally.  It might be used to clean up state,
      * free memory, etc.
      */
@@ -124,6 +180,9 @@ int frootmon_close(my_bpftimeval ts)
      * of time or on a number of packets.  In the original code
      * this is where we closed an output pcap file.
      */
+	twalk(req_root, frootmon_dump);
+	frootmon_clear(&req_root);
+
     return 0;
 }
 
@@ -137,10 +196,15 @@ void frootmon_output(const char* descr, iaddr from, iaddr to, uint8_t proto, uns
      * "output" because in the original code this is where
      * packets were outputted.
      *
-     * if flags & PCAP_OUTPUT_ISDNS != 0 then payload is the start of a DNS message.
+     * if flags & DNSCAP_OUTPUT_ISDNS != 0 then payload is the start of a DNS message.
      *
-     * if flags & PCAP_OUTPUT_ISFRAG != 0 then the packet is a fragment.
+     * if flags & DNSCAP_OUTPUT_ISFRAG != 0 then the packet is a fragment.
      *
-     * if flags & PCAP_OUTPUT_ISLAYER != 0 then the pkt_copy is the same as payload.
+     * if flags & DNSCAP_OUTPUT_ISLAYER != 0 then the pkt_copy is the same as payload.
      */
+
+	if (flags & DNSCAP_OUTPUT_ISDNS) {
+		uint64_t key = ntohs(*(uint16_t *)(payload + 2)); // check payloadlen
+		frootmon_inc(&req_root, key);
+	}
 }
